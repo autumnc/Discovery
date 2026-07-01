@@ -173,13 +173,15 @@ impl App {
             }
             AppAction::ThreadDetailResult(Err(msg), _) => { self.loading = false; self.set_status(&format!("加载失败: {}", msg), true); }
             AppAction::ImageData(data) => {
-                self.image_data = data;
-                let total = self.image_data.len();
+                let total = data.len();
                 if total > 0 {
-                    self.set_status(&format!("图片 1/{} | Tab 下一张  p 关闭 | k/j 移动  f 折叠  r 回复", total), false);
+                    self.image_data = data;
+                    self.image_index = 0;
+                    self.set_status(&format!("图片 1/{} | Tab 下一张  p 关闭", total), false);
                 } else {
-                    self.image_data.clear(); self.show_images = false;
-                    self.set_status("无图片 | k/j 移动  f 折叠  r 回复", false);
+                    self.image_data.clear();
+                    self.show_images = false;
+                    self.set_status("无图片或下载失败 | k/j 移动  f 折叠  r 回复", false);
                 }
             }
         }
@@ -219,18 +221,35 @@ impl App {
         let Some(ref detail) = self.detail else { return };
         let Some(post) = detail.posts.get(self.detail_scroll) else { return };
         let urls: Vec<String> = post.contents.iter().filter_map(|f| match f {
-            crate::model::post::ContentFragment::Image { url, .. } => Some(url.clone()),
+            crate::model::post::ContentFragment::Image { url, .. } => {
+                let u = if url.contains("://") { url.clone() } else { format!("{}{}", *crate::constants::BASE_URL, url) };
+                Some(u)
+            }
             _ => None,
         }).collect();
-        if urls.is_empty() { let _ = self.action_tx.send(AppAction::ImageData(vec![])); return; }
+        if urls.is_empty() {
+            let _ = self.action_tx.send(AppAction::ImageData(vec![]));
+            return;
+        }
         let http = self.http.clone(); let tx = self.action_tx.clone();
+        let total = urls.len();
         tokio::spawn(async move {
             let mut data = Vec::new();
+            let mut loaded = 0usize;
             for url in &urls {
-                if let Ok(bytes) = http.get_raw(url).await {
-                    if let Ok(img) = image::load_from_memory(&bytes) {
-                        data.push(crate::sixel::encode(&img, 320, 240));
+                match http.get_raw(url).await {
+                    Ok(bytes) => {
+                        if bytes.len() > 100 {
+                            match image::load_from_memory(&bytes) {
+                                Ok(img) => {
+                                    let s = crate::sixel::encode(&img, 320, 240);
+                                    if !s.is_empty() { data.push(s); loaded += 1; }
+                                }
+                                Err(_) => {}
+                            }
+                        }
                     }
+                    Err(_) => {}
                 }
             }
             let _ = tx.send(AppAction::ImageData(data));
@@ -536,7 +555,10 @@ impl App {
         f.render_widget(block, area);
         f.render_widget(Paragraph::new(vl), area.inner(ratatui::layout::Margin { vertical: 1, horizontal: 1 }));
         if self.show_images {
-            self.img_area.set(Some((area.x + area.width.saturating_sub(42), area.y + area.height / 2)));
+            // Position image at right edge inside the block, aligned to col 0 for sixel compat
+            let col = area.x + area.width.saturating_sub(42).max(area.x + 2);
+            let row = area.y + area.height.saturating_sub(12).max(area.y + 2);
+            self.img_area.set(Some((col, row)));
         }
     }
 
