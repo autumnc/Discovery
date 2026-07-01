@@ -2,9 +2,9 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Color, Modifier},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Tabs},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Tabs, Wrap},
     Frame,
 };
 use std::cell::Cell;
@@ -49,7 +49,8 @@ enum AppAction {
     LoginResult(Result<String, String>),
     ThreadListResult(Result<ThreadList, String>),
     ThreadDetailResult(Result<ThreadDetail, String>, String),
-    ImageData(Vec<Vec<u8>>),
+    PreviewData(Vec<u8>, String),
+    DownloadDone(u64),
 }
 
 pub async fn run(config: Config) -> anyhow::Result<()> {
@@ -81,8 +82,9 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         action_tx: action_tx.clone(),
         show_forum_panel: false, detail_folded: false, show_list_detail: false,
         list_scroll: Cell::new(0),
-        show_images: false, image_data: vec![], image_index: 0,
-        img_area: Cell::new(None),
+        preview: false, preview_urls: vec![], download_urls: vec![], preview_index: 0,
+        preview_sixel: vec![], preview_dirty: false,
+        download_msg: String::new(), download_msg_at: std::time::Instant::now(),
     };
     app.load_forums();
 
@@ -95,18 +97,61 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         tokio::spawn(async move { let _ = tx.send(AppAction::LoginResult(do_login(&http, &u, &p).await)); });
     }
 
+    let mut was_preview = false;
+    let mut last_scroll = 0usize;
+
     loop {
-        terminal.draw(|f| app.render(f))?;
-        if app.show_images && !app.image_data.is_empty() {
-            if let Some((col, row)) = app.img_area.get() {
-                let idx = app.image_index.min(app.image_data.len().saturating_sub(1));
-                let mut stdout = std::io::stdout();
-                let _ = execute!(stdout, crossterm::cursor::MoveTo(col, row));
-                let _ = stdout.write_all(&app.image_data[idx]);
-                let _ = stdout.flush();
-            }
-        }
+        let (tw, th) = crossterm::terminal::size().ok().unwrap_or((80, 24));
+
         while let Ok(action) = action_rx.try_recv() { app.handle_action(action); }
+
+        // Full clear on preview close
+        if was_preview && !app.preview {
+            terminal.clear()?;
+        }
+        was_preview = app.preview;
+
+        terminal.draw(|f| app.render(f, tw, th))?;
+
+        // Clear nerd icon residue: rightmost 3 cols of content area after any scroll
+        let scroll = app.list_scroll.get();
+        if scroll != last_scroll && th > 2 {
+            let mut stdout = std::io::stdout();
+            let area_right = tw.saturating_sub(3);
+            let blank = "   ";
+            for row in 1..th.saturating_sub(1) {
+                let _ = execute!(stdout, crossterm::cursor::MoveTo(area_right, row));
+                let _ = stdout.write_all(blank.as_bytes());
+            }
+            let _ = stdout.flush();
+        }
+        last_scroll = scroll;
+
+        // Preview panel sixel — must be AFTER terminal.draw() to not be overwritten
+        if app.preview && app.preview_dirty && !app.preview_sixel.is_empty() {
+            let panel_w = (tw as f64 * 0.8) as u16;
+            let panel_h = th.saturating_sub(2);
+            let panel_x = (tw - panel_w) / 2;
+            let panel_y = 1;
+            // Parse sixel dimensions for centering: \x1bP...q"1;1;W;H
+            let (img_w, img_h_rows) = parse_sixel_size(&app.preview_sixel);
+            let offset_x = panel_x + if img_w < panel_w { (panel_w - img_w) / 2 } else { 0 };
+            let offset_y = panel_y + if img_h_rows < panel_h { (panel_h - img_h_rows) / 2 } else { 0 };
+            let mut stdout = std::io::stdout();
+            let blank = " ".repeat(panel_w as usize);
+            for row in panel_y..panel_y + panel_h {
+                let _ = execute!(stdout, crossterm::cursor::MoveTo(panel_x, row));
+                let _ = stdout.write_all(blank.as_bytes());
+            }
+            let _ = execute!(stdout, crossterm::cursor::MoveTo(offset_x, offset_y));
+            let _ = stdout.write_all(&app.preview_sixel);
+            let _ = stdout.flush();
+            app.preview_dirty = false;
+        }
+
+        if !app.download_msg.is_empty() && app.download_msg_at.elapsed() > std::time::Duration::from_secs(3) {
+            app.download_msg.clear();
+        }
         if event::poll(std::time::Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind != KeyEventKind::Press { continue; }
@@ -143,8 +188,9 @@ struct App {
     action_tx: tokio::sync::mpsc::UnboundedSender<AppAction>,
     show_forum_panel: bool, detail_folded: bool, show_list_detail: bool,
     list_scroll: Cell<usize>,
-    show_images: bool, image_data: Vec<Vec<u8>>, image_index: usize,
-    img_area: Cell<Option<(u16, u16)>>,
+    preview: bool, preview_urls: Vec<String>, download_urls: Vec<String>, preview_index: usize,
+    preview_sixel: Vec<u8>, preview_dirty: bool,
+    download_msg: String, download_msg_at: std::time::Instant,
 }
 
 impl App {
@@ -169,20 +215,23 @@ impl App {
             AppAction::ThreadDetailResult(Ok(detail), tid) => {
                 self.loading = false; self.reply_tid = tid; self.detail_page = detail.page;
                 self.detail = Some(detail); self.detail_scroll = 0;
-                self.set_status("k/j 移动  f 折叠  r 回复  p 图片  Esc 返回", false);
+                self.set_status("k/j 移动  f 折叠  r 回复  p 预览  Esc 返回", false);
             }
             AppAction::ThreadDetailResult(Err(msg), _) => { self.loading = false; self.set_status(&format!("加载失败: {}", msg), true); }
-            AppAction::ImageData(data) => {
-                let total = data.len();
-                if total > 0 {
-                    self.image_data = data;
-                    self.image_index = 0;
-                    self.set_status(&format!("图片 1/{} | Tab 下一张  p 关闭", total), false);
+            AppAction::PreviewData(data, url) => {
+                if data.is_empty() {
+                    self.set_status(&format!("预览失败, URL: {}", url), true);
                 } else {
-                    self.image_data.clear();
-                    self.show_images = false;
-                    self.set_status("无图片或下载失败 | k/j 移动  f 折叠  r 回复", false);
+                    self.preview_sixel = data;
+                    self.preview_dirty = true;
+                    let n = self.preview_urls.len();
+                    self.set_status(&format!("预览 {}/{} | Tab 切换  d 下载  Esc 关闭",
+                        self.preview_index + 1, n), false);
                 }
+            }
+            AppAction::DownloadDone(size) => {
+                self.download_msg = format!("下载完成 ({})", crate::utils::to_size_text(size));
+                self.download_msg_at = std::time::Instant::now();
             }
         }
     }
@@ -217,42 +266,76 @@ impl App {
         });
     }
 
-    fn spawn_load_images(&self) {
+
+
+    fn open_preview(&mut self) {
         let Some(ref detail) = self.detail else { return };
         let Some(post) = detail.posts.get(self.detail_scroll) else { return };
-        let urls: Vec<String> = post.contents.iter().filter_map(|f| match f {
-            crate::model::post::ContentFragment::Image { url, .. } => {
-                let u = if url.contains("://") { url.clone() } else { format!("{}{}", *crate::constants::BASE_URL, url) };
-                Some(u)
+        let pairs: Vec<(String, String)> = post.contents.iter().filter_map(|f| match f {
+            crate::model::post::ContentFragment::Image { url, thumb_url, .. } => {
+                // Preview uses thumb_url (with .thumb.jpg), download uses url (without .thumb.)
+                let preview = if !thumb_url.is_empty() { thumb_url.clone() } else { url.clone() };
+                if preview.is_empty() { None } else { Some((preview, url.clone())) }
             }
             _ => None,
         }).collect();
-        if urls.is_empty() {
-            let _ = self.action_tx.send(AppAction::ImageData(vec![]));
-            return;
-        }
+        if pairs.is_empty() { self.set_status("无图片", false); return; }
+        self.preview_urls = pairs.iter().map(|(p, _)| p.clone()).collect();
+        self.download_urls = pairs.iter().map(|(_, d)| d.clone()).collect();
+        self.preview_index = 0;
+        self.preview = true;
+        self.preview_sixel.clear();
+        self.preview_dirty = true;
+        self.set_status("加载预览中...", false);
+        self.spawn_preview_load();
+    }
+
+    fn spawn_preview_load(&self) {
+        if self.preview_urls.is_empty() { return; }
+        let url = self.preview_urls[self.preview_index].clone();
         let http = self.http.clone(); let tx = self.action_tx.clone();
-        let total = urls.len();
         tokio::spawn(async move {
-            let mut data = Vec::new();
-            let mut loaded = 0usize;
-            for url in &urls {
-                match http.get_raw(url).await {
-                    Ok(bytes) => {
-                        if bytes.len() > 100 {
-                            match image::load_from_memory(&bytes) {
-                                Ok(img) => {
-                                    let s = crate::sixel::encode(&img, 320, 240);
-                                    if !s.is_empty() { data.push(s); loaded += 1; }
-                                }
-                                Err(_) => {}
-                            }
-                        }
+            let result: Result<Vec<u8>, String> = async {
+                let bytes = http.get_raw(&url).await.map_err(|e| format!("下载失败: {}", e))?;
+                if bytes.len() < 100 { return Err("图片数据太小".into()); }
+                let mut child = std::process::Command::new("img2sixel")
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .map_err(|e| format!("img2sixel: {}", e))?;
+                use std::io::Write;
+                if let Some(mut stdin) = child.stdin.take() { let _ = stdin.write_all(&bytes); }
+                let out = child.wait_with_output().map_err(|e| format!("img2sixel wait: {}", e))?;
+                if !out.status.success() {
+                    return Err(format!("img2sixel err: {}", String::from_utf8_lossy(&out.stderr).trim()));
+                }
+                if out.stdout.is_empty() { return Err("img2sixel 输出空".into()); }
+                Ok(out.stdout)
+            }.await;
+            match result {
+                Ok(data) => { let _ = tx.send(AppAction::PreviewData(data, url)); }
+                Err(e) => { let _ = tx.send(AppAction::PreviewData(vec![], format!("{}: {}", url, e))); }
+            }
+        });
+    }
+
+    fn download_current_image(&self) {
+        if self.download_urls.is_empty() { return; }
+        let url = self.download_urls[self.preview_index].clone();
+        let http = self.http.clone(); let tx = self.action_tx.clone();
+        let dl_dir = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()) + "/Downloads";
+        tokio::spawn(async move {
+            if let Ok(bytes) = http.get_raw(&url).await {
+                if bytes.len() > 100 {
+                    let fname = url.rsplit('/').next().unwrap_or("image.jpg");
+                    let path = format!("{}/{}", dl_dir, fname);
+                    let size = bytes.len() as u64;
+                    if std::fs::write(&path, &bytes).is_ok() {
+                        let _ = tx.send(AppAction::DownloadDone(size));
                     }
-                    Err(_) => {}
                 }
             }
-            let _ = tx.send(AppAction::ImageData(data));
         });
     }
 
@@ -288,17 +371,22 @@ impl App {
         match code {
             KeyCode::Char('q') => self.screen = Screen::Quit,
             KeyCode::Tab => {
-                if self.show_images && self.detail.is_some() && !self.image_data.is_empty() {
-                    self.image_index = (self.image_index + 1) % self.image_data.len();
-                    self.set_status(&format!("图片 {}/{} | Tab 下一张  p 关闭 | k/j 移动  f 折叠  r 回复", self.image_index + 1, self.image_data.len()), false);
+                if self.preview && !self.preview_urls.is_empty() {
+                    self.preview_index = (self.preview_index + 1) % self.preview_urls.len();
+                    self.preview_sixel.clear(); self.preview_dirty = true;
+                    let u = &self.preview_urls[self.preview_index];
+                    self.set_status(&format!("加载: {}", if u.len() > 60 { &u[u.len()-60..] } else { u }), false);
+                    self.spawn_preview_load();
                 } else {
                     self.active_tab = (self.active_tab + 1) % self.tabs.len(); self.detail = None; self.simple_list = SimpleList::default();
                 }
             }
             KeyCode::BackTab => { if self.active_tab == 0 { self.active_tab = self.tabs.len() - 1; } else { self.active_tab -= 1; } self.detail = None; }
             KeyCode::Esc => {
-                if self.detail.is_some() {
-                    self.detail = None; self.detail_scroll = 0; self.show_images = false; self.image_data.clear();
+                if self.preview {
+                    self.preview = false; self.preview_sixel.clear();
+                } else if self.detail.is_some() {
+                    self.detail = None; self.detail_scroll = 0;
                     let hint = if self.show_list_detail { "d=简洁" } else { "d=详情" };
                     self.set_status(&format!("{} 主题 | k/j=上下 Enter=查看 r=刷新 {} b=板块 q=退出", self.threads.threads.len(), hint), false);
                 } else { self.search_mode = false; }
@@ -309,18 +397,26 @@ impl App {
             KeyCode::Left | KeyCode::Char('h') => self.prev_page(),
             KeyCode::PageUp => self.next_page(),
             KeyCode::PageDown => self.prev_page(),
-            KeyCode::Enter => self.select_item(),
+            KeyCode::Enter => {
+                if self.preview {
+                    // Preview panel: do nothing on Enter (handled by d key)
+                } else {
+                    self.select_item();
+                }
+            }
             KeyCode::Char('p') => {
                 if self.detail.is_some() {
-                    if self.show_images { self.show_images = false; self.image_data.clear(); self.set_status("k/j 移动  f 折叠  r 回复  p 图片  Esc 返回", false); }
-                    else { self.show_images = true; self.image_index = 0; self.image_data.clear(); self.set_status("加载图片中...", false); self.spawn_load_images(); }
+                    if self.preview {
+                        self.preview = false; self.preview_sixel.clear();
+                    } else {
+                        self.open_preview();
+                    }
                 }
             }
             KeyCode::Char('f') => {
                 if self.detail.is_some() {
                     self.detail_folded = !self.detail_folded;
-                    let state = if self.detail_folded { "折叠" } else { "展开" };
-                    self.set_status(&format!("{} | k/j 移动  f 折叠  r 回复  p 图片", if self.detail_folded { "折叠中" } else { "展开中" }), false);
+                    self.set_status(&format!("{} | k/j 移动  f 折叠  r 回复  p 预览", if self.detail_folded { "折叠中" } else { "展开中" }), false);
                 }
             }
             KeyCode::Char('r') => {
@@ -329,7 +425,9 @@ impl App {
             }
             KeyCode::Char('n') => { if self.detail.is_none() && self.active_tab == 0 { self.start_new_thread(); } }
             KeyCode::Char('d') => {
-                if self.detail.is_none() && self.simple_list.items.is_empty() {
+                if self.preview {
+                    self.download_current_image();
+                } else if self.detail.is_none() && self.simple_list.items.is_empty() {
                     self.show_list_detail = !self.show_list_detail;
                     let hint = if self.show_list_detail { "d=简洁" } else { "d=详情" };
                     self.set_status(&format!("{} 主题 | k/j=上下 Enter=查看 r=刷新 {} b=板块 q=退出", self.threads.threads.len(), hint), false);
@@ -401,8 +499,8 @@ impl App {
         }
     }
 
-    fn render(&self, f: &mut Frame) {
-        match self.screen { Screen::Login => self.render_login(f), Screen::Main => self.render_main(f), Screen::Quit => {} }
+    fn render(&self, f: &mut Frame, tw: u16, th: u16) {
+        match self.screen { Screen::Login => self.render_login(f), Screen::Main => self.render_main(f, tw, th), Screen::Quit => {} }
     }
 
     fn render_login(&self, f: &mut Frame) {
@@ -436,7 +534,7 @@ impl App {
         f.render_widget(Paragraph::new(hint).centered(), rows[4]);
     }
 
-    fn render_main(&self, f: &mut Frame) {
+    fn render_main(&self, f: &mut Frame, _tw: u16, _th: u16) {
         let area = f.area();
         let layout = Layout::default().direction(Direction::Vertical).constraints([Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)]).split(area);
         let tab_items: Vec<Line> = self.tabs.iter().enumerate().map(|(i, t)| {
@@ -456,8 +554,30 @@ impl App {
         else { self.render_simple_list(f, main_layout[0]); }
         if self.composing { self.render_compose(f, area); }
         if self.search_mode { self.render_search(f, area); }
+
+        // Preview panel overlay
+        if self.preview {
+            let panel_w = (area.width as f64 * 0.8) as u16;
+            let panel_h = area.height.saturating_sub(2);
+            let panel_x = (area.width - panel_w) / 2;
+            let panel_rect = Rect::new(area.x + panel_x, area.y + 1, panel_w, panel_h);
+            let url = self.preview_urls.get(self.preview_index).map(|s| s.as_str()).unwrap_or("");
+            let title = format!(" 预览 {}/{} | {} ",
+                self.preview_index + 1, self.preview_urls.len(),
+                if url.len() > 50 { &url[url.len()-50..] } else { url });
+            let block = Block::default().borders(Borders::ALL).border_style(Theme::accent())
+                .title(title).title_style(Theme::text_dim());
+            f.render_widget(block, panel_rect);
+        }
+
         let ss = if self.status_error { Theme::status_error() } else { Theme::status_normal() };
-        let status_text = if self.loading { " 加载中... ".to_string() } else { format!(" {} ", self.status_msg) };
+        let status_text = if !self.download_msg.is_empty() {
+            format!(" {} ", self.download_msg)
+        } else if self.loading {
+            " 加载中... ".to_string()
+        } else {
+            format!(" {} ", self.status_msg)
+        };
         f.render_widget(Paragraph::new(Line::from(Span::styled(status_text, ss))), layout[2]);
     }
 
@@ -482,27 +602,28 @@ impl App {
         let items: Vec<ListItem> = self.threads.threads.iter().enumerate().skip(scroll).take(visible).map(|(i, t)| {
             let prefix = if i == self.selected_thread { ">" } else { " " };
             let count_str: String = t.count_cmts.chars().take(4).collect();
-            let icon = if t.is_poll { "\u{f080}" } else if t.with_pic { "\u{f03e}" } else { " " };
+            let icon = if t.is_poll { "\u{f080} " } else if t.with_pic { "\u{f03e} " } else { "  " };
             let left = format!("{}[{:>4}] ", prefix, count_str);
             let line = if self.show_list_detail {
                 let author: String = t.author.chars().take(6).collect();
                 let tl = t.time_create.chars().count();
                 let time = if tl > 5 { t.time_create.chars().skip(tl - 5).collect::<String>() } else { t.time_create.clone() };
-                let right = format!("{}  \u{f007} {:>6}  \u{f073} {}", icon, author, time);
+                let right = format!("{}  \u{f007}  {:>6}  \u{f073}  {}", icon, author, time);
                 let tmax = 35usize; let tt: String = t.title.chars().take(tmax).collect();
                 let mid = format!("{}{}  {}", left, tt, right);
-                let pad = inner_w.saturating_sub(mid.chars().count());
-                format!("{}{}", mid, " ".repeat(pad))
+                let pad = inner_w.saturating_sub(mid.chars().count() + 2);
+                format!("{}{}  ", mid, " ".repeat(pad))
             } else {
                 let tt: String = t.title.chars().take(50).collect();
                 let mid = format!("{}{} {}", left, tt, icon);
-                let pad = inner_w.saturating_sub(mid.chars().count());
-                format!("{}{}", mid, " ".repeat(pad))
+                let pad = inner_w.saturating_sub(mid.chars().count() + 2);
+                format!("{}{}  ", mid, " ".repeat(pad))
             };
             if i == self.selected_thread { ListItem::new(Line::from(Span::styled(line, Theme::selected_dim()))) }
             else { ListItem::new(Line::from(Span::styled(line, Theme::text()))) }
         }).collect();
         let fnm = self.forums.get(self.selected_forum).map(|f| f.1.as_str()).unwrap_or("?");
+        f.render_widget(Clear, area);
         f.render_widget(List::new(items).block(
             Block::default().borders(Borders::ALL).border_style(Theme::block())
                 .title(format!(" {} (页 {}) ", fnm, self.thread_page)).title_style(Theme::text_dim())
@@ -510,10 +631,12 @@ impl App {
     }
 
     fn render_thread_detail(&self, f: &mut Frame, area: Rect, detail: &ThreadDetail) {
+        let text_area = area;
+
         let mut lines: Vec<Line> = Vec::new();
         lines.push(Line::from(Span::styled(format!(" {}", detail.title), Theme::accent_bold())));
         let fh = if self.detail_folded { "f=展开" } else { "f=折叠" };
-        lines.push(Line::from(Span::styled(format!(" 页 {}/{} | k/j 移动  h/l 翻页  {}  r 回复  p 图片  Esc 返回", detail.page, detail.last_page, fh), Theme::text_dim())));
+        lines.push(Line::from(Span::styled(format!(" 页 {}/{} | k/j 移动  h/l 翻页  {}  r 回复  p 预览  d 下载  Esc 返回", detail.page, detail.last_page, fh), Theme::text_dim())));
         lines.push(Line::from(""));
         for (i, post) in detail.posts.iter().enumerate() {
             let ind = if i == self.detail_scroll { "▸" } else { " " };
@@ -527,8 +650,14 @@ impl App {
                             let mut s = Theme::text(); if *bold { s = s.add_modifier(Modifier::BOLD); } if !color.is_empty() { s = s.fg(str_to_color(color)); }
                             lines.push(Line::from(Span::styled(format!("  {}", text), s)));
                         }
-                        crate::model::post::ContentFragment::Link { text, .. } => { lines.push(Line::from(Span::styled(format!("  ↳ {}", text), Theme::blue()))); }
-                        crate::model::post::ContentFragment::Image { url, .. } => { lines.push(Line::from(Span::styled(format!("  ◉ {}", url), Theme::green()))); }
+                        crate::model::post::ContentFragment::Link { text, .. } => {
+                            let short = if text.len() > 40 { format!("{}…", &text[..39]) } else { text.clone() };
+                            lines.push(Line::from(Span::styled(format!("  ↳ {}", short), Theme::blue())));
+                        }
+                        crate::model::post::ContentFragment::Image { url, .. } => {
+                            let fname = url.rsplit('/').next().unwrap_or(url);
+                            lines.push(Line::from(Span::styled(format!("  ◉ {}", fname), Theme::green())));
+                        }
                         crate::model::post::ContentFragment::Quote { author_and_time, .. } => { lines.push(Line::from(Span::styled(format!("  ┃ {}", author_and_time), Theme::text_dim()))); }
                         crate::model::post::ContentFragment::LineBreak => { lines.push(Line::from("")); }
                         crate::model::post::ContentFragment::Notice(msg) => { lines.push(Line::from(Span::styled(format!("  {}", msg), Theme::text_dim()))); }
@@ -538,7 +667,7 @@ impl App {
                 lines.push(Line::from(""));
             }
         }
-        let visible = area.height.saturating_sub(3) as usize;
+        let visible = text_area.height.saturating_sub(3) as usize;
         let total_lines = lines.len();
         let mut sel_line = 0usize; let mut lc = 0usize;
         for (pi, post) in detail.posts.iter().enumerate() {
@@ -550,17 +679,16 @@ impl App {
         let scroll = if sel_line + ph <= visible { 0 } else { let mid = sel_line.saturating_sub(visible / 2); mid.min(total_lines.saturating_sub(visible)) };
         let end = (scroll + visible).min(total_lines);
         let vl: Vec<Line> = lines[scroll..end].to_vec();
+        f.render_widget(Clear, text_area);
         let block = Block::default().borders(Borders::ALL).border_style(Theme::block())
             .title(format!(" 帖子 ({} 回复) ", detail.posts.len())).title_style(Theme::text_dim());
-        f.render_widget(block, area);
-        f.render_widget(Paragraph::new(vl), area.inner(ratatui::layout::Margin { vertical: 1, horizontal: 1 }));
-        if self.show_images {
-            // Position image at right edge inside the block, aligned to col 0 for sixel compat
-            let col = area.x + area.width.saturating_sub(42).max(area.x + 2);
-            let row = area.y + area.height.saturating_sub(12).max(area.y + 2);
-            self.img_area.set(Some((col, row)));
-        }
+        f.render_widget(block, text_area);
+        f.render_widget(
+            Paragraph::new(vl).wrap(Wrap { trim: false }),
+            text_area.inner(ratatui::layout::Margin { vertical: 1, horizontal: 1 }),
+        );
     }
+
 
     fn render_simple_list(&self, f: &mut Frame, area: Rect) {
         let title = match self.simple_list_type {
@@ -593,6 +721,24 @@ impl App {
         f.render_widget(Paragraph::new(format!(" 🔍 {}▌", self.search_query)).style(Theme::text())
             .block(Block::default().borders(Borders::ALL).border_style(Theme::accent()).title(" 搜索 ").title_style(Theme::accent())), c[1]);
     }
+}
+
+fn parse_sixel_size(data: &[u8]) -> (u16, u16) {
+    // Sixel raster: \x1bP...q"1;1;W;H...
+    if let Some(q) = data.iter().position(|&b| b == b'q') {
+        let rest = &data[q+1..];
+        if rest.len() > 4 && rest[0] == b'"' {
+            let s = String::from_utf8_lossy(&rest[1..rest.len().min(64)]);
+            // Format: "1;1;W;H"
+            let parts: Vec<&str> = s.split(';').collect();
+            if parts.len() >= 4 {
+                let w: u16 = parts[2].parse().unwrap_or(0);
+                let h: u16 = parts[3].split(|c: char| !c.is_ascii_digit()).next().unwrap_or("0").parse().unwrap_or(0);
+                return (w, h / 6); // h pixels → rows (6px per sixel row)
+            }
+        }
+    }
+    (1, 1)
 }
 
 fn str_to_color(s: &str) -> Color {

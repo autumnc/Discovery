@@ -56,11 +56,43 @@ pub fn parse(html: &str, tid: &str) -> Option<ThreadDetail> {
             if let Some(img) = dl.select(&Selector::parse("img").unwrap()).next() {
                 let src = img.value().attr("src").unwrap_or("");
                 let file = img.value().attr("file").unwrap_or("");
+                let zoomfile = img.value().attr("zoomfile").unwrap_or("");
                 let onclick = img.value().attr("onclick").unwrap_or("");
-                let url = if !onclick.is_empty() { onclick } else { file };
-                let thumb = if src.contains("thumb.") { src } else { "" };
-                let full = if url.is_empty() { thumb } else { url };
-                post.contents.push(ContentFragment::Image { url: abs_url(full), thumb_url: abs_url(thumb), size });
+                if src.contains("attachimg.gif") { continue; }
+                let onclick_url = if onclick.contains('\'') {
+                    crate::utils::get_middle_string(&onclick, "'", "'")
+                } else { String::new() };
+                let original = if !onclick_url.is_empty() { onclick_url }
+                    else if !file.is_empty() { file.to_string() }
+                    else if !zoomfile.is_empty() { zoomfile.to_string() }
+                    else if src.contains(".thumb.") {
+                        src.replace(".thumb.jpg", ".jpg")
+                           .replace(".thumb.png", ".png")
+                    } else { src.to_string() };
+                // Reconstruct thumb URL from original (src may be truncated)
+                let thumb = if !file.is_empty() && file.contains(".thumb.") { file.to_string() }
+                    else if !zoomfile.is_empty() && zoomfile.contains(".thumb.") { zoomfile.to_string() }
+                    else if src.contains(".thumb.") {
+                        // If we have the original from zoomfile, reconstruct thumb from it
+                        if !zoomfile.is_empty() {
+                            if zoomfile.ends_with(".jpg") { zoomfile.to_string() + ".thumb.jpg" }
+                            else if zoomfile.ends_with(".png") { zoomfile.to_string() + ".thumb.png" }
+                            else if zoomfile.ends_with(".jpeg") { zoomfile.to_string() + ".thumb.jpeg" }
+                            else { src.to_string() }
+                        } else if !original.is_empty() && original != src {
+                            if original.ends_with(".jpg") { original.to_string() + ".thumb.jpg" }
+                            else if original.ends_with(".png") { original.to_string() + ".thumb.png" }
+                            else { src.to_string() }
+                        } else { src.to_string() }
+                    }
+                    else if original.ends_with(".jpg") || original.ends_with(".png") || original.ends_with(".gif") {
+                        original.clone()
+                    } else { String::new() };
+                post.contents.push(ContentFragment::Image {
+                    url: abs_url(&original),
+                    thumb_url: abs_url(&thumb),
+                    size,
+                });
             }
         }
         detail.posts.push(post);
@@ -82,8 +114,30 @@ fn walk_node<'a>(node: NodeRef<'a, scraper::Node>, post: &mut PostItem, _level: 
                 "img" => {
                     if let Some(elem) = ElementRef::wrap(node) {
                         let src = elem.value().attr("src").unwrap_or("");
-                        if src.contains("://") && !src.contains("data:image/") && !src.contains("smilies") && !src.contains("common") {
-                            post.contents.push(ContentFragment::Image { url: abs_url(src), thumb_url: String::new(), size: 0 });
+                        if !src.is_empty() && !src.contains("data:image/")
+                            && !src.contains("smilies") && !src.contains("common")
+                            && !src.contains("attachimg.gif")
+                            && !src.contains("images/default")
+                        {
+                            let file = elem.value().attr("file").unwrap_or("");
+                            let onclick = elem.value().attr("onclick").unwrap_or("");
+                            let onclick_url = if onclick.contains('\'') {
+                                crate::utils::get_middle_string(&onclick, "'", "'")
+                            } else { String::new() };
+                            let orig = if !onclick_url.is_empty() { onclick_url }
+                                else if !file.is_empty() { file.to_string() }
+                                else if src.contains(".thumb.") {
+                                    src.replace(".thumb.jpg", ".jpg")
+                                       .replace(".thumb.png", ".png")
+                                } else { src.to_string() };
+                            let thumb = if !file.is_empty() && file.contains(".thumb.") { file.to_string() }
+                                else if src.contains(".thumb.") { src.to_string() }
+                                else { orig.clone() };
+                            post.contents.push(ContentFragment::Image {
+                                url: abs_url(&orig),
+                                thumb_url: abs_url(&thumb),
+                                size: 0,
+                            });
                         }
                     }
                 }
@@ -116,4 +170,8 @@ fn walk_node<'a>(node: NodeRef<'a, scraper::Node>, post: &mut PostItem, _level: 
 #[derive(Clone, Default)]
 struct TextStyleState { bold: bool, italic: bool, underline: bool, strike: bool, color: String, small_font: bool }
 
-fn abs_url(url: &str) -> String { if url.contains("://") || url.is_empty() { url.to_string() } else { format!("{}{}", *crate::constants::BASE_URL, url) } }
+fn abs_url(url: &str) -> String {
+    if url.contains("://") || url.is_empty() { return url.to_string(); }
+    // Images are hosted on img02 subdomain
+    format!("https://img02.4d4y.com/forum/{}", url.trim_start_matches('/'))
+}
