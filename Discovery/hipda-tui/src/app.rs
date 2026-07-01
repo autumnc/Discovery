@@ -17,6 +17,7 @@ use crate::http::HttpClient;
 use crate::model::post::ThreadDetail;
 use crate::model::simple::SimpleList;
 use crate::model::thread::ThreadList;
+use crate::theme::Theme;
 
 #[derive(Clone, Copy, PartialEq)]
 enum LoginField { Username, Password }
@@ -389,19 +390,30 @@ impl App {
         let area = f.area();
         let pw = area.width.min(60); let ph = 14;
         let pa = Rect::new(area.x + (area.width.saturating_sub(pw)) / 2, area.y + (area.height.saturating_sub(ph)) / 2, pw, ph);
-        f.render_widget(Block::default().borders(Borders::ALL).title(" HiPDA 登录 ").style(Style::default()), pa);
+        f.render_widget(Block::default().borders(Borders::ALL).border_style(Theme::block()).title(" HiPDA 登录 ").title_style(Theme::accent()), pa);
         let inner = pa.inner(ratatui::layout::Margin { vertical: 1, horizontal: 2 });
         let rows = Layout::default().direction(Direction::Vertical).constraints([Constraint::Length(1), Constraint::Length(3), Constraint::Length(1), Constraint::Length(3), Constraint::Length(2)]).split(inner);
-        let uc = if self.login_focus == LoginField::Username && !self.login_loading { "█" } else { "" };
-        let us = if self.login_focus == LoginField::Username && !self.login_loading { Style::default().fg(Color::Cyan) } else { Style::default().fg(Color::White) };
-        f.render_widget(Paragraph::new(format!("{} {}", self.login_username, uc)).block(Block::default().borders(Borders::ALL).title(" 用户名 ")).style(us), rows[1]);
+        let cursor = if self.login_loading { "" } else { "▌" };
+        let field_style = |focused: bool| {
+            if focused && !self.login_loading { Theme::accent() } else { Theme::text_dim() }
+        };
+        let border_style = |focused: bool| {
+            if focused && !self.login_loading { Theme::accent() } else { Theme::block() }
+        };
+        f.render_widget(
+            Paragraph::new(format!("{} {}", self.login_username, if self.login_focus == LoginField::Username { cursor } else { "" }))
+                .block(Block::default().borders(Borders::ALL).border_style(border_style(self.login_focus == LoginField::Username)).title(" 用户名 ").title_style(field_style(self.login_focus == LoginField::Username)))
+                .style(field_style(self.login_focus == LoginField::Username)),
+            rows[1]);
         let mask: String = self.login_password.chars().map(|_| '•').collect();
-        let pc = if self.login_focus == LoginField::Password && !self.login_loading { "█" } else { "" };
-        let ps = if self.login_focus == LoginField::Password && !self.login_loading { Style::default().fg(Color::Cyan) } else { Style::default().fg(Color::White) };
-        f.render_widget(Paragraph::new(format!("{} {}", mask, pc)).block(Block::default().borders(Borders::ALL).title(" 密码 ")).style(ps), rows[3]);
-        let hint = if self.login_loading { Line::from(Span::styled("登录中...", Style::default().fg(Color::Yellow))) }
-        else if !self.login_error.is_empty() { Line::from(Span::styled(self.login_error.as_str(), Style::default().fg(Color::Red))) }
-        else { Line::from(vec![Span::styled("Enter", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)), Span::raw(" 登录  "), Span::styled("Tab", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)), Span::raw(" 切换  "), Span::styled("Esc", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)), Span::raw(" 退出")]) };
+        f.render_widget(
+            Paragraph::new(format!("{} {}", mask, if self.login_focus == LoginField::Password { cursor } else { "" }))
+                .block(Block::default().borders(Borders::ALL).border_style(border_style(self.login_focus == LoginField::Password)).title(" 密码 ").title_style(field_style(self.login_focus == LoginField::Password)))
+                .style(field_style(self.login_focus == LoginField::Password)),
+            rows[3]);
+        let hint = if self.login_loading { Line::from(Span::styled("登录中...", Theme::yellow())) }
+        else if !self.login_error.is_empty() { Line::from(Span::styled(self.login_error.as_str(), Theme::red())) }
+        else { Line::from(vec![Span::styled(" Enter ", Theme::selected()), Span::styled(" 登录  ", Theme::text_dim()), Span::styled(" Tab ", Theme::selected()), Span::styled(" 切换  ", Theme::text_dim()), Span::styled(" Esc ", Theme::selected()), Span::styled(" 退出", Theme::text_dim())]) };
         f.render_widget(Paragraph::new(hint).centered(), rows[4]);
     }
 
@@ -409,10 +421,10 @@ impl App {
         let area = f.area();
         let layout = Layout::default().direction(Direction::Vertical).constraints([Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)]).split(area);
         let tab_items: Vec<Line> = self.tabs.iter().enumerate().map(|(i, t)| {
-            if i == self.active_tab { Line::from(Span::styled(*t, Style::default().fg(Color::Black).bg(Color::Cyan))) }
-            else { Line::from(Span::styled(*t, Style::default().fg(Color::Gray))) }
+            if i == self.active_tab { Line::from(Span::styled(format!(" {} ", t), Theme::tab_active())) }
+            else { Line::from(Span::styled(format!(" {} ", t), Theme::tab_inactive())) }
         }).collect();
-        f.render_widget(Tabs::new(tab_items), layout[0]);
+        f.render_widget(Tabs::new(tab_items).style(Theme::text_dim()), layout[0]);
         let main_layout = Layout::default().direction(Direction::Horizontal).constraints(
             if self.detail.is_some() || !self.simple_list.items.is_empty() { vec![Constraint::Min(0)] }
             else if self.show_forum_panel { vec![Constraint::Length(14), Constraint::Min(0)] }
@@ -425,17 +437,18 @@ impl App {
         else { self.render_simple_list(f, main_layout[0]); }
         if self.composing { self.render_compose(f, area); }
         if self.search_mode { self.render_search(f, area); }
-        let ss = if self.status_error { Style::default().fg(Color::Red) } else { Style::default().fg(Color::Gray) };
-        f.render_widget(Paragraph::new(Line::from(Span::styled(if self.loading { "加载中..." } else { &self.status_msg }, ss))), layout[2]);
+        let ss = if self.status_error { Theme::status_error() } else { Theme::status_normal() };
+        let status_text = if self.loading { " 加载中... ".to_string() } else { format!(" {} ", self.status_msg) };
+        f.render_widget(Paragraph::new(Line::from(Span::styled(status_text, ss))), layout[2]);
     }
 
     fn render_forum_list(&self, f: &mut Frame, area: Rect) {
         let items: Vec<ListItem> = self.forums.iter().enumerate().map(|(i, (_, name))| {
-            let label = if i == self.selected_forum { format!(">{}", name) } else { format!(" {}", name) };
-            if i == self.selected_forum { ListItem::new(Line::from(Span::styled(label, Style::default().fg(Color::Cyan)))) }
-            else { ListItem::new(Line::from(Span::styled(label, Style::default()))) }
+            let label = if i == self.selected_forum { format!("  {} ", name) } else { format!("  {} ", name) };
+            if i == self.selected_forum { ListItem::new(Line::from(Span::styled(label, Theme::selected()))) }
+            else { ListItem::new(Line::from(Span::styled(label, Theme::text()))) }
         }).collect();
-        f.render_widget(List::new(items).block(Block::default().borders(Borders::ALL).title("版块")), area);
+        f.render_widget(List::new(items).block(Block::default().borders(Borders::ALL).border_style(Theme::block()).title(" 版块 ").title_style(Theme::text_dim())), area);
     }
 
     fn render_thread_list(&self, f: &mut Frame, area: Rect) {
@@ -467,36 +480,39 @@ impl App {
                 let pad = inner_w.saturating_sub(mid.chars().count());
                 format!("{}{}", mid, " ".repeat(pad))
             };
-            if i == self.selected_thread { ListItem::new(Line::from(Span::styled(line, Style::default().fg(Color::Cyan)))) }
-            else { ListItem::new(Line::from(Span::styled(line, Style::default()))) }
+            if i == self.selected_thread { ListItem::new(Line::from(Span::styled(line, Theme::selected_dim()))) }
+            else { ListItem::new(Line::from(Span::styled(line, Theme::text()))) }
         }).collect();
         let fnm = self.forums.get(self.selected_forum).map(|f| f.1.as_str()).unwrap_or("?");
-        f.render_widget(List::new(items).block(Block::default().borders(Borders::ALL).title(format!("{} (页 {})", fnm, self.thread_page))), area);
+        f.render_widget(List::new(items).block(
+            Block::default().borders(Borders::ALL).border_style(Theme::block())
+                .title(format!(" {} (页 {}) ", fnm, self.thread_page)).title_style(Theme::text_dim())
+        ), area);
     }
 
     fn render_thread_detail(&self, f: &mut Frame, area: Rect, detail: &ThreadDetail) {
         let mut lines: Vec<Line> = Vec::new();
-        lines.push(Line::from(Span::styled(format!("标题: {}", detail.title), Style::default().fg(Color::Yellow))));
+        lines.push(Line::from(Span::styled(format!(" {}", detail.title), Theme::accent_bold())));
         let fh = if self.detail_folded { "f=展开" } else { "f=折叠" };
-        lines.push(Line::from(Span::styled(format!("页 {}/{} | k/j 移动  h/l 翻页  {}  r 回复  p 图片  Esc 返回", detail.page, detail.last_page, fh), Style::default().fg(Color::Gray))));
+        lines.push(Line::from(Span::styled(format!(" 页 {}/{} | k/j 移动  h/l 翻页  {}  r 回复  p 图片  Esc 返回", detail.page, detail.last_page, fh), Theme::text_dim())));
         lines.push(Line::from(""));
         for (i, post) in detail.posts.iter().enumerate() {
-            let ind = if i == self.detail_scroll { ">" } else { " " };
-            lines.push(Line::from(Span::styled(format!("{}#{:02} {} | {}", ind, post.floor, post.author, post.time_post),
-                if i == self.detail_scroll { Style::default().fg(Color::Cyan) } else { Style::default().fg(Color::White) })));
+            let ind = if i == self.detail_scroll { "▸" } else { " " };
+            lines.push(Line::from(Span::styled(format!(" {} #{:02}  {}  {}", ind, post.floor, post.author, post.time_post),
+                if i == self.detail_scroll { Theme::accent() } else { Theme::text_muted() })));
             if !self.detail_folded || i == self.detail_scroll {
                 lines.push(Line::from(""));
                 for frag in &post.contents {
                     match frag {
                         crate::model::post::ContentFragment::Text { text, bold, color, .. } => {
-                            let mut s = Style::default(); if *bold { s = s.add_modifier(Modifier::BOLD); } if !color.is_empty() { s = s.fg(str_to_color(color)); }
-                            lines.push(Line::from(Span::styled(text.clone(), s)));
+                            let mut s = Theme::text(); if *bold { s = s.add_modifier(Modifier::BOLD); } if !color.is_empty() { s = s.fg(str_to_color(color)); }
+                            lines.push(Line::from(Span::styled(format!("  {}", text), s)));
                         }
-                        crate::model::post::ContentFragment::Link { text, .. } => { lines.push(Line::from(Span::styled(format!("[链接: {}]", text), Style::default().fg(Color::Blue)))); }
-                        crate::model::post::ContentFragment::Image { url, .. } => { lines.push(Line::from(Span::styled(format!("[图片: {}]", url), Style::default().fg(Color::Green)))); }
-                        crate::model::post::ContentFragment::Quote { author_and_time, .. } => { lines.push(Line::from(Span::styled(format!("[引用: {}]", author_and_time), Style::default().fg(Color::DarkGray)))); }
+                        crate::model::post::ContentFragment::Link { text, .. } => { lines.push(Line::from(Span::styled(format!("  ↳ {}", text), Theme::blue()))); }
+                        crate::model::post::ContentFragment::Image { url, .. } => { lines.push(Line::from(Span::styled(format!("  ◉ {}", url), Theme::green()))); }
+                        crate::model::post::ContentFragment::Quote { author_and_time, .. } => { lines.push(Line::from(Span::styled(format!("  ┃ {}", author_and_time), Theme::text_dim()))); }
                         crate::model::post::ContentFragment::LineBreak => { lines.push(Line::from("")); }
-                        crate::model::post::ContentFragment::Notice(msg) => { lines.push(Line::from(Span::styled(msg.clone(), Style::default().fg(Color::Gray)))); }
+                        crate::model::post::ContentFragment::Notice(msg) => { lines.push(Line::from(Span::styled(format!("  {}", msg), Theme::text_dim()))); }
                         _ => {}
                     }
                 }
@@ -515,9 +531,10 @@ impl App {
         let scroll = if sel_line + ph <= visible { 0 } else { let mid = sel_line.saturating_sub(visible / 2); mid.min(total_lines.saturating_sub(visible)) };
         let end = (scroll + visible).min(total_lines);
         let vl: Vec<Line> = lines[scroll..end].to_vec();
-        let block = Block::default().borders(Borders::ALL).title(format!("帖子 ({} 回复)", detail.posts.len()));
+        let block = Block::default().borders(Borders::ALL).border_style(Theme::block())
+            .title(format!(" 帖子 ({} 回复) ", detail.posts.len())).title_style(Theme::text_dim());
         f.render_widget(block, area);
-        f.render_widget(Paragraph::new(vl), area.inner(ratatui::layout::Margin { vertical: 1, horizontal: 2 }));
+        f.render_widget(Paragraph::new(vl), area.inner(ratatui::layout::Margin { vertical: 1, horizontal: 1 }));
         if self.show_images {
             self.img_area.set(Some((area.x + area.width.saturating_sub(42), area.y + area.height / 2)));
         }
@@ -530,25 +547,29 @@ impl App {
             SimpleListType::SmsDetail => "短消息详情", SimpleListType::Notify => "通知",
         };
         let items: Vec<ListItem> = self.simple_list.items.iter().enumerate().map(|(i, item)| {
-            let p = if i == self.simple_selected { ">" } else { " " };
-            let t = format!("{} {} | {} | {}", p, item.title, item.author, item.time);
-            if i == self.simple_selected { ListItem::new(Line::from(Span::styled(t, Style::default().fg(Color::Cyan)))) }
-            else { ListItem::new(Line::from(Span::styled(t, Style::default()))) }
+            let p = if i == self.simple_selected { "▸" } else { " " };
+            let t = format!(" {} {} | {} | {}", p, item.title, item.author, item.time);
+            if i == self.simple_selected { ListItem::new(Line::from(Span::styled(t, Theme::accent()))) }
+            else { ListItem::new(Line::from(Span::styled(t, Theme::text()))) }
         }).collect();
-        f.render_widget(List::new(items).block(Block::default().borders(Borders::ALL).title(title)), area);
+        f.render_widget(List::new(items).block(
+            Block::default().borders(Borders::ALL).border_style(Theme::block()).title(format!(" {} ", title)).title_style(Theme::text_dim())
+        ), area);
     }
 
     fn render_compose(&self, f: &mut Frame, area: Rect) {
         let pa = centered_rect(area, 70, 60);
         let c = Layout::default().direction(Direction::Vertical).constraints([Constraint::Length(1), Constraint::Min(3)]).split(pa);
         let t = match self.compose_mode { PostMode::ReplyThread => "回复", PostMode::ReplyPost => "回复楼层", PostMode::QuotePost => "引用回复", PostMode::NewThread => "发表新帖", PostMode::EditPost => "编辑", };
-        f.render_widget(Paragraph::new(self.compose_content.as_str()).block(Block::default().borders(Borders::ALL).title(t)), c[1]);
+        f.render_widget(Paragraph::new(self.compose_content.as_str()).style(Theme::text())
+            .block(Block::default().borders(Borders::ALL).border_style(Theme::accent()).title(format!(" {} ", t)).title_style(Theme::accent())), c[1]);
     }
 
     fn render_search(&self, f: &mut Frame, area: Rect) {
         let pa = centered_rect(area, 50, 10);
         let c = Layout::default().direction(Direction::Vertical).constraints([Constraint::Length(1), Constraint::Length(3)]).split(pa);
-        f.render_widget(Paragraph::new(format!("搜索: {}_", self.search_query)).block(Block::default().borders(Borders::ALL).title("搜索")), c[1]);
+        f.render_widget(Paragraph::new(format!(" 🔍 {}▌", self.search_query)).style(Theme::text())
+            .block(Block::default().borders(Borders::ALL).border_style(Theme::accent()).title(" 搜索 ").title_style(Theme::accent())), c[1]);
     }
 }
 

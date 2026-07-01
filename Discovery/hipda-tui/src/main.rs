@@ -5,6 +5,7 @@ mod http;
 mod model;
 mod parser;
 mod sixel;
+mod theme;
 mod ui;
 mod utils;
 
