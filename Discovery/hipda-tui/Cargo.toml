@@ -1,0 +1,27 @@
+[package]
+name = "hipda-tui"
+version = "1.0.0"
+edition = "2021"
+description = "TUI forum client for HiPDA (4d4y.com)"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
+scraper = "0.22"
+ego-tree = "0.10"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+md-5 = "0.10"
+encoding_rs = "0.8"
+anyhow = "1"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif"] }
