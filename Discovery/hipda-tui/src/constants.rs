@@ -37,3 +37,12 @@ pub const FORUMS: &[Forum] = &[
 pub const DEFAULT_FORUMS: &[i32] = &[FID_DISCOVERY, FID_BS, 7];
 
 pub fn get_forum_by_fid(fid: i32) -> Option<&'static Forum> { FORUMS.iter().find(|f| f.id == fid) }
+
+// Tab endpoint URLs (matching Discuz! 7.2 / HiPDA Android app)
+pub const URL_MY_POSTS: &str = "my.php?item=threads";
+pub const URL_MY_REPLIES: &str = "my.php?item=posts";
+pub const URL_FAVORITES: &str = "my.php?item=favorites&type=thread";
+pub const URL_ATTENTION: &str = "my.php?item=buddylist&type=thread";
+pub const URL_SMS: &str = "pm.php?filter=privatepm";
+pub const URL_NOTIFY: &str = "notice.php";
+pub const URL_SEARCH: &str = "search.php?srchtype={srchtype}&srchtxt={srchtxt}&searchsubmit=true&st=on&srchuname={srchuname}&srchfilter=all&srchfrom=0&before=&orderby=lastpost&ascdesc=desc&srchfid%5B0%5D={fid}";

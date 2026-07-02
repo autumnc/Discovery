@@ -10,6 +10,7 @@ use ratatui::{
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::io::Write;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use std::sync::Arc;
 
 use crate::config::Config;
@@ -48,6 +49,7 @@ async fn do_login(http: &HttpClient, username: &str, password: &str) -> Result<S
 enum AppAction {
     LoginResult(Result<String, String>),
     ThreadListResult(Result<ThreadList, String>),
+    SimpleListResult(Result<SimpleList, String>, SimpleListType),
     ThreadDetailResult(Result<ThreadDetail, String>, String),
     PreviewData(Vec<u8>, String),
     DownloadDone(u64),
@@ -70,7 +72,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         forums: vec![], selected_forum: 0,
         threads: ThreadList::default(), selected_thread: 0, thread_page: 1, thread_total_pages: 1,
         detail: None, detail_scroll: 0, detail_page: 1,
-        simple_list: SimpleList::default(), simple_list_type: SimpleListType::Search, simple_selected: 0,
+        simple_list: SimpleList::default(), simple_list_type: SimpleListType::Search, simple_selected: 0, simple_page: 1,
         sms_detail_list: SimpleList::default(), sms_selected: 0, sms_uid: String::new(), sms_username: String::new(),
         composing: false, compose_content: String::new(), compose_subject: String::new(), compose_cursor: 0,
         compose_mode: PostMode::ReplyThread,
@@ -80,7 +82,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         tabs: vec!["Forums", "MyPosts", "MyReplies", "Favorites", "Attention", "SMS", "Notify", "Search"],
         active_tab: 0,
         action_tx: action_tx.clone(),
-        show_forum_panel: false, detail_folded: false, show_list_detail: false,
+        show_forum_panel: false, focus_forum_panel: false, detail_folded: false, show_list_detail: false,
         list_scroll: Cell::new(0),
         preview: false, preview_urls: vec![], download_urls: vec![], preview_index: 0,
         preview_sixel: vec![], preview_dirty: false,
@@ -98,7 +100,6 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     }
 
     let mut was_preview = false;
-    let mut last_scroll = 0usize;
 
     loop {
         let (tw, th) = crossterm::terminal::size().ok().unwrap_or((80, 24));
@@ -112,20 +113,6 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         was_preview = app.preview;
 
         terminal.draw(|f| app.render(f, tw, th))?;
-
-        // Clear nerd icon residue: rightmost 3 cols of content area after any scroll
-        let scroll = app.list_scroll.get();
-        if scroll != last_scroll && th > 2 {
-            let mut stdout = std::io::stdout();
-            let area_right = tw.saturating_sub(3);
-            let blank = "   ";
-            for row in 1..th.saturating_sub(1) {
-                let _ = execute!(stdout, crossterm::cursor::MoveTo(area_right, row));
-                let _ = stdout.write_all(blank.as_bytes());
-            }
-            let _ = stdout.flush();
-        }
-        last_scroll = scroll;
 
         // Preview panel sixel — must be AFTER terminal.draw() to not be overwritten
         if app.preview && app.preview_dirty && !app.preview_sixel.is_empty() {
@@ -178,7 +165,7 @@ struct App {
     forums: Vec<(i32, String)>, selected_forum: usize,
     threads: ThreadList, selected_thread: usize, thread_page: i32, thread_total_pages: i32,
     detail: Option<ThreadDetail>, detail_scroll: usize, detail_page: i32,
-    simple_list: SimpleList, simple_list_type: SimpleListType, simple_selected: usize,
+    simple_list: SimpleList, simple_list_type: SimpleListType, simple_selected: usize, simple_page: i32,
     sms_detail_list: SimpleList, sms_selected: usize, sms_uid: String, sms_username: String,
     composing: bool, compose_content: String, compose_subject: String, compose_cursor: usize,
     compose_mode: PostMode, reply_tid: String, reply_pid: String, reply_fid: i32,
@@ -186,7 +173,7 @@ struct App {
     status_msg: String, status_error: bool, loading: bool,
     tabs: Vec<&'static str>, active_tab: usize,
     action_tx: tokio::sync::mpsc::UnboundedSender<AppAction>,
-    show_forum_panel: bool, detail_folded: bool, show_list_detail: bool,
+    show_forum_panel: bool, focus_forum_panel: bool, detail_folded: bool, show_list_detail: bool,
     list_scroll: Cell<usize>,
     preview: bool, preview_urls: Vec<String>, download_urls: Vec<String>, preview_index: usize,
     preview_sixel: Vec<u8>, preview_dirty: bool,
@@ -206,12 +193,18 @@ impl App {
             }
             AppAction::LoginResult(Err(msg)) => { self.login_loading = false; self.login_error = msg; }
             AppAction::ThreadListResult(Ok(list)) => {
-                self.threads = list; self.thread_total_pages = 1; self.loading = false;
+                self.thread_total_pages = list.max_page;
+                self.threads = list; self.loading = false;
                 self.selected_thread = 0; self.list_scroll.set(0);
                 let hint = if self.show_list_detail { "d=简洁" } else { "d=详情" };
-                self.set_status(&format!("{} 主题 | k/j=上下 Enter=查看 r=刷新 {} b=板块 q=退出", self.threads.threads.len(), hint), false);
+                self.set_status(&format!("{} 主题 | /=搜索 h/l=翻页 k/j=上下 Enter=查看 r=刷新 {} b=板块 q=退出", self.threads.threads.len(), hint), false);
             }
             AppAction::ThreadListResult(Err(msg)) => { self.loading = false; self.set_status(&format!("加载失败: {}", msg), true); }
+            AppAction::SimpleListResult(Ok(list), st) => {
+                self.simple_list = list; self.simple_list_type = st; self.simple_selected = 0; self.loading = false;
+                self.set_status("k/j 移动  Enter 查看  /=搜索  Esc 返回", false);
+            }
+            AppAction::SimpleListResult(Err(msg), _) => { self.loading = false; self.set_status(&format!("加载失败: {}", msg), true); }
             AppAction::ThreadDetailResult(Ok(detail), tid) => {
                 self.loading = false; self.reply_tid = tid; self.detail_page = detail.page;
                 self.detail = Some(detail); self.detail_scroll = 0;
@@ -246,6 +239,64 @@ impl App {
                 Ok(html) => { let _ = tx.send(AppAction::ThreadListResult(Ok(crate::parser::thread_list::parse(&html)))); }
                 Err(e) => { let _ = tx.send(AppAction::ThreadListResult(Err(e.to_string()))); }
             }
+        });
+    }
+
+    fn tab_type(tab: usize) -> SimpleListType {
+        match tab {
+            1 => SimpleListType::MyPosts, 2 => SimpleListType::MyReplies,
+            3 => SimpleListType::Favorites, 4 => SimpleListType::Attention,
+            5 => SimpleListType::Sms, 6 => SimpleListType::Notify,
+            7 => SimpleListType::Search,
+            _ => SimpleListType::Search,
+        }
+    }
+
+    fn spawn_load_simple_list(&self, tab: usize) {
+        let http = self.http.clone(); let tx = self.action_tx.clone();
+        let st = Self::tab_type(tab);
+        let page = self.simple_page;
+        let mut target = match tab {
+            1 => format!("{}{}", *crate::constants::BASE_URL, crate::constants::URL_MY_POSTS),
+            2 => format!("{}{}", *crate::constants::BASE_URL, crate::constants::URL_MY_REPLIES),
+            3 => format!("{}{}", *crate::constants::BASE_URL, crate::constants::URL_FAVORITES),
+            4 => format!("{}{}", *crate::constants::BASE_URL, crate::constants::URL_ATTENTION),
+            5 => format!("{}{}", *crate::constants::BASE_URL, crate::constants::URL_SMS),
+            6 => format!("{}{}", *crate::constants::BASE_URL, crate::constants::URL_NOTIFY),
+            7 => {
+                let enc = |s: &str| -> String {
+                    let mut encoder = encoding_rs::GBK.new_encoder();
+                    let max_len = s.len() * 2 + 2;
+                    let mut dst = vec![0u8; max_len];
+                    let (_, _, written) = encoder.encode_from_utf8_without_replacement(s, &mut dst, true);
+                    dst.truncate(written);
+                    dst.iter().map(|&b| format!("%{:02X}", b)).collect::<Vec<_>>().join("")
+                };
+                format!("{}{}", *crate::constants::BASE_URL,
+                    crate::constants::URL_SEARCH
+                        .replace("{srchtype}", "title")
+                        .replace("{srchtxt}", &enc(&self.search_query))
+                        .replace("{srchuname}", "")
+                        .replace("{fid}", "0"))
+            }
+            _ => return,
+        };
+        if page > 1 { target.push_str(&format!("&page={}", page)); }
+        tokio::spawn(async move {
+            let result: Result<SimpleList, String> = async {
+                let html = http.get(&target).await.map_err(|e| e.to_string())?;
+                let list = match st {
+                    SimpleListType::MyPosts => crate::parser::simple_list::parse_my_posts(&html),
+                    SimpleListType::MyReplies => crate::parser::simple_list::parse_my_replies(&html),
+                    SimpleListType::Favorites | SimpleListType::Attention => crate::parser::simple_list::parse_favorites(&html),
+                    SimpleListType::Sms => crate::parser::simple_list::parse_sms(&html),
+                    SimpleListType::Notify => crate::parser::simple_list::parse_notify(&html),
+                    SimpleListType::Search => crate::parser::simple_list::parse_search(&html),
+                    _ => SimpleList::default(),
+                };
+                Ok(list)
+            }.await;
+            let _ = tx.send(AppAction::SimpleListResult(result, st));
         });
     }
 
@@ -379,16 +430,29 @@ impl App {
                     self.spawn_preview_load();
                 } else {
                     self.active_tab = (self.active_tab + 1) % self.tabs.len(); self.detail = None; self.simple_list = SimpleList::default();
+                    self.activate_tab();
                 }
             }
-            KeyCode::BackTab => { if self.active_tab == 0 { self.active_tab = self.tabs.len() - 1; } else { self.active_tab -= 1; } self.detail = None; }
+            KeyCode::BackTab => {
+                if self.active_tab == 0 { self.active_tab = self.tabs.len() - 1; } else { self.active_tab -= 1; }
+                self.detail = None; self.simple_list = SimpleList::default();
+                self.activate_tab();
+            }
             KeyCode::Esc => {
                 if self.preview {
                     self.preview = false; self.preview_sixel.clear();
+                } else if self.focus_forum_panel {
+                    self.focus_forum_panel = false;
+                    let hint = if self.show_list_detail { "d=简洁" } else { "d=详情" };
+                    self.set_status(&format!("{} 主题 | /=搜索 h/l=翻页 k/j=上下 Enter=查看 r=刷新 {} b=板块 q=退出", self.threads.threads.len(), hint), false);
                 } else if self.detail.is_some() {
                     self.detail = None; self.detail_scroll = 0;
                     let hint = if self.show_list_detail { "d=简洁" } else { "d=详情" };
-                    self.set_status(&format!("{} 主题 | k/j=上下 Enter=查看 r=刷新 {} b=板块 q=退出", self.threads.threads.len(), hint), false);
+                    self.set_status(&format!("{} 主题 | /=搜索 h/l=翻页 k/j=上下 Enter=查看 r=刷新 {} b=板块 q=退出", self.threads.threads.len(), hint), false);
+                } else if self.active_tab != 0 {
+                    self.active_tab = 0; self.simple_list = SimpleList::default();
+                    self.show_forum_panel = false;
+                    self.loading = true; self.set_status("加载中...", false); self.spawn_load_threads();
                 } else { self.search_mode = false; }
             }
             KeyCode::Up | KeyCode::Char('j') => self.move_up(),
@@ -421,24 +485,29 @@ impl App {
             }
             KeyCode::Char('r') => {
                 if self.detail.is_some() || self.simple_list_type == SimpleListType::SmsDetail { self.start_reply(); }
-                else if self.detail.is_none() && self.simple_list.items.is_empty() { self.loading = true; self.set_status("刷新中...", false); self.spawn_load_threads(); }
+                else if self.detail.is_none() { self.activate_tab(); }
             }
             KeyCode::Char('n') => { if self.detail.is_none() && self.active_tab == 0 { self.start_new_thread(); } }
             KeyCode::Char('d') => {
                 if self.preview {
                     self.download_current_image();
-                } else if self.detail.is_none() && self.simple_list.items.is_empty() {
+                } else if self.detail.is_none() && self.active_tab == 0 {
                     self.show_list_detail = !self.show_list_detail;
                     let hint = if self.show_list_detail { "d=简洁" } else { "d=详情" };
-                    self.set_status(&format!("{} 主题 | k/j=上下 Enter=查看 r=刷新 {} b=板块 q=退出", self.threads.threads.len(), hint), false);
+                    self.set_status(&format!("{} 主题 | /=搜索 h/l=翻页 k/j=上下 Enter=查看 r=刷新 {} b=板块 q=退出", self.threads.threads.len(), hint), false);
                 }
             }
             KeyCode::Char('b') => {
-                self.show_forum_panel = !self.show_forum_panel;
-                if self.show_forum_panel { self.set_status("版块面板已展开 | b=关闭", false); }
-                else {
-                    let hint = if self.show_list_detail { "d=简洁" } else { "d=详情" };
-                    self.set_status(&format!("{} 主题 | k/j=上下 Enter=查看 r=刷新 {} b=板块 q=退出", self.threads.threads.len(), hint), false);
+                if self.active_tab == 0 && self.detail.is_none() {
+                    self.show_forum_panel = !self.show_forum_panel;
+                    if self.show_forum_panel {
+                        self.focus_forum_panel = true;
+                        self.set_status("版块面板 | k/j=移动 Enter=选择 b=关闭", false);
+                    } else {
+                        self.focus_forum_panel = false;
+                        let hint = if self.show_list_detail { "d=简洁" } else { "d=详情" };
+                        self.set_status(&format!("{} 主题 | /=搜索 h/l=翻页 k/j=上下 Enter=查看 r=刷新 {} b=板块 q=退出", self.threads.threads.len(), hint), false);
+                    }
                 }
             }
             KeyCode::Char('/') => { self.search_mode = true; self.search_query.clear(); }
@@ -446,26 +515,49 @@ impl App {
         }
     }
 
+    fn activate_tab(&mut self) {
+        self.focus_forum_panel = false;
+        if self.active_tab == 0 {
+            self.simple_list = SimpleList::default();
+            self.loading = true; self.set_status("加载中...", false); self.spawn_load_threads();
+        } else {
+            self.simple_list_type = Self::tab_type(self.active_tab);
+            self.simple_page = 1;
+            self.loading = true; self.set_status("加载中...", false); self.spawn_load_simple_list(self.active_tab);
+        }
+    }
+
     fn move_up(&mut self) {
         if self.detail.is_some() { if self.detail_scroll > 0 { self.detail_scroll -= 1; } }
-        else if self.simple_list.items.is_empty() { if self.selected_thread > 0 { self.selected_thread -= 1; } }
+        else if self.focus_forum_panel { if self.selected_forum > 0 { self.selected_forum -= 1; } }
+        else if self.active_tab == 0 { if self.selected_thread > 0 { self.selected_thread -= 1; } }
         else if self.simple_selected > 0 { self.simple_selected -= 1; }
     }
     fn move_down(&mut self) {
         if let Some(ref d) = self.detail { if self.detail_scroll < d.posts.len().saturating_sub(1) { self.detail_scroll += 1; } }
-        else if self.simple_list.items.is_empty() { if self.selected_thread < self.threads.threads.len().saturating_sub(1) { self.selected_thread += 1; } }
+        else if self.focus_forum_panel { if self.selected_forum < self.forums.len().saturating_sub(1) { self.selected_forum += 1; } }
+        else if self.active_tab == 0 { if self.selected_thread < self.threads.threads.len().saturating_sub(1) { self.selected_thread += 1; } }
         else if self.simple_selected < self.simple_list.items.len().saturating_sub(1) { self.simple_selected += 1; }
     }
     fn next_page(&mut self) {
         if let Some(ref d) = self.detail { if self.detail_page < d.last_page { self.detail_page += 1; self.loading = true; self.spawn_load_thread_detail(&self.reply_tid, self.detail_page); } }
-        else if self.simple_list.items.is_empty() { if self.thread_page < self.thread_total_pages { self.thread_page += 1; self.loading = true; self.spawn_load_threads(); } }
+        else if self.active_tab == 0 { if self.thread_page < self.thread_total_pages { self.thread_page += 1; self.loading = true; self.spawn_load_threads(); } }
+        else if self.simple_page < self.simple_list.max_page { self.simple_page += 1; self.loading = true; self.spawn_load_simple_list(self.active_tab); }
     }
     fn prev_page(&mut self) {
         if self.detail.is_some() { if self.detail_page > 1 { self.detail_page -= 1; self.loading = true; self.spawn_load_thread_detail(&self.reply_tid, self.detail_page); } }
-        else if self.thread_page > 1 { self.thread_page -= 1; self.loading = true; self.spawn_load_threads(); }
+        else if self.active_tab == 0 && self.thread_page > 1 { self.thread_page -= 1; self.loading = true; self.spawn_load_threads(); }
+        else if self.simple_page > 1 { self.simple_page -= 1; self.loading = true; self.spawn_load_simple_list(self.active_tab); }
     }
     fn select_item(&mut self) {
-        if self.simple_list.items.is_empty() {
+        if self.focus_forum_panel {
+            self.focus_forum_panel = false;
+            self.show_forum_panel = false;
+            self.thread_page = 1; self.selected_thread = 0; self.list_scroll.set(0);
+            self.loading = true; self.set_status("加载中...", false); self.spawn_load_threads();
+            return;
+        }
+        if self.active_tab == 0 {
             if let Some(t) = self.threads.threads.get(self.selected_thread) {
                 let tid = t.tid.clone(); self.reply_tid = tid.clone(); self.reply_fid = self.forums[self.selected_forum].0;
                 self.detail_page = 1; self.loading = true; self.set_status("加载帖子中...", false); self.spawn_load_thread_detail(&tid, 1);
@@ -474,6 +566,9 @@ impl App {
             let tid = item.tid.clone(); self.reply_tid = tid.clone();
             if !item.pid.is_empty() { self.reply_pid = item.pid.clone(); }
             self.detail_page = 1; self.loading = true; self.set_status("加载帖子中...", false); self.spawn_load_thread_detail(&tid, 1);
+        } else {
+            // empty simple list: retry loading
+            self.activate_tab();
         }
     }
     fn start_reply(&mut self) { self.composing = true; self.compose_mode = PostMode::ReplyThread; self.compose_content.clear(); self.compose_cursor = 0; }
@@ -492,7 +587,18 @@ impl App {
     fn handle_search_key(&mut self, code: KeyCode) {
         match code {
             KeyCode::Esc => self.search_mode = false,
-            KeyCode::Enter => { self.search_mode = false; self.set_status(&format!("搜索: {}", self.search_query), false); }
+            KeyCode::Enter => {
+                self.search_mode = false;
+                if self.search_query.is_empty() { return; }
+                self.active_tab = 7; // Search tab
+                self.detail = None;
+                self.simple_list = SimpleList::default();
+                self.simple_list_type = SimpleListType::Search;
+                self.simple_page = 1;
+                self.loading = true;
+                self.set_status("搜索中...", false);
+                self.spawn_load_simple_list(7);
+            }
             KeyCode::Char(c) => self.search_query.push(c),
             KeyCode::Backspace => { self.search_query.pop(); }
             _ => {}
@@ -538,16 +644,16 @@ impl App {
         let area = f.area();
         let layout = Layout::default().direction(Direction::Vertical).constraints([Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)]).split(area);
         let tab_items: Vec<Line> = self.tabs.iter().enumerate().map(|(i, t)| {
-            if i == self.active_tab { Line::from(Span::styled(format!(" {} ", t), Theme::tab_active())) }
-            else { Line::from(Span::styled(format!(" {} ", t), Theme::tab_inactive())) }
+            if i == self.active_tab { Line::from(Span::styled(format!("{}", t), Theme::tab_active())) }
+            else { Line::from(Span::styled(format!("{}", t), Theme::tab_inactive())) }
         }).collect();
-        f.render_widget(Tabs::new(tab_items).style(Theme::text_dim()), layout[0]);
+        f.render_widget(Tabs::new(tab_items).divider("|").style(Theme::text_dim()), layout[0]);
         let main_layout = Layout::default().direction(Direction::Horizontal).constraints(
-            if self.detail.is_some() || !self.simple_list.items.is_empty() { vec![Constraint::Min(0)] }
-            else if self.show_forum_panel { vec![Constraint::Length(14), Constraint::Min(0)] }
+            if self.detail.is_some() || self.active_tab != 0 { vec![Constraint::Min(0)] }
+            else if self.show_forum_panel { vec![Constraint::Length(20), Constraint::Min(0)] }
             else { vec![Constraint::Min(0)] }
         ).split(layout[1]);
-        if self.detail.is_none() && self.simple_list.items.is_empty() {
+        if self.active_tab == 0 && self.detail.is_none() {
             if self.show_forum_panel { self.render_forum_list(f, main_layout[0]); self.render_thread_list(f, main_layout[1]); }
             else { self.render_thread_list(f, main_layout[0]); }
         } else if let Some(ref d) = self.detail { self.render_thread_detail(f, main_layout[0], d); }
@@ -587,11 +693,15 @@ impl App {
             if i == self.selected_forum { ListItem::new(Line::from(Span::styled(label, Theme::selected()))) }
             else { ListItem::new(Line::from(Span::styled(label, Theme::text()))) }
         }).collect();
-        f.render_widget(List::new(items).block(Block::default().borders(Borders::ALL).border_style(Theme::block()).title(" 版块 ").title_style(Theme::text_dim())), area);
+        f.render_widget(Clear, area);
+        f.render_widget(List::new(items), area.inner(ratatui::layout::Margin { vertical: 1, horizontal: 1 }));
+        let border_style = if self.focus_forum_panel { Theme::accent() } else { Theme::block() };
+        f.render_widget(Block::default().borders(Borders::ALL).border_style(border_style).title(" 版块 ").title_style(Theme::text_dim()), area);
     }
 
     fn render_thread_list(&self, f: &mut Frame, area: Rect) {
-        let inner_w = area.width.saturating_sub(4) as usize;
+        // inner_w = area - 2 borders - 2 margin - 1 safety = area - 5
+        let inner_w = area.width.saturating_sub(5) as usize;
         let visible = area.height.saturating_sub(2) as usize;
         let total = self.threads.threads.len();
         let mut scroll = self.list_scroll.get();
@@ -604,30 +714,30 @@ impl App {
             let count_str: String = t.count_cmts.chars().take(4).collect();
             let icon = if t.is_poll { "\u{f080} " } else if t.with_pic { "\u{f03e} " } else { "  " };
             let left = format!("{}[{:>4}] ", prefix, count_str);
-            let line = if self.show_list_detail {
-                let author: String = t.author.chars().take(6).collect();
+            let mut line = if self.show_list_detail {
+                let author: String = take_display_width(&t.author, 6);
                 let tl = t.time_create.chars().count();
                 let time = if tl > 5 { t.time_create.chars().skip(tl - 5).collect::<String>() } else { t.time_create.clone() };
-                let right = format!("{}  \u{f007}  {:>6}  \u{f073}  {}", icon, author, time);
-                let tmax = 35usize; let tt: String = t.title.chars().take(tmax).collect();
-                let mid = format!("{}{}  {}", left, tt, right);
-                let pad = inner_w.saturating_sub(mid.chars().count() + 2);
-                format!("{}{}  ", mid, " ".repeat(pad))
+                let right = format!("{} \u{f007}  {:>6}  \u{f073}  {}", icon, author, time);
+                let tmax = 35usize; let tt: String = take_display_width(&t.title, tmax);
+                format!("{} {}  {}", left, tt, right)
             } else {
-                let tt: String = t.title.chars().take(50).collect();
-                let mid = format!("{}{} {}", left, tt, icon);
-                let pad = inner_w.saturating_sub(mid.chars().count() + 2);
-                format!("{}{}  ", mid, " ".repeat(pad))
+                let tt: String = take_display_width(&t.title, 50);
+                format!("{} {} {}", left, tt, icon)
             };
+            // safety truncation: ensure no overflow into right border
+            if display_width(&line) > inner_w { line = take_display_width(&line, inner_w); }
             if i == self.selected_thread { ListItem::new(Line::from(Span::styled(line, Theme::selected_dim()))) }
             else { ListItem::new(Line::from(Span::styled(line, Theme::text()))) }
         }).collect();
         let fnm = self.forums.get(self.selected_forum).map(|f| f.1.as_str()).unwrap_or("?");
         f.render_widget(Clear, area);
-        f.render_widget(List::new(items).block(
+        f.render_widget(List::new(items), area.inner(ratatui::layout::Margin { vertical: 1, horizontal: 1 }));
+        f.render_widget(
             Block::default().borders(Borders::ALL).border_style(Theme::block())
-                .title(format!(" {} (页 {}) ", fnm, self.thread_page)).title_style(Theme::text_dim())
-        ), area);
+                .title(format!(" {} (页 {}) ", fnm, self.thread_page)).title_style(Theme::text_dim()),
+            area,
+        );
     }
 
     fn render_thread_detail(&self, f: &mut Frame, area: Rect, detail: &ThreadDetail) {
@@ -636,7 +746,7 @@ impl App {
         let mut lines: Vec<Line> = Vec::new();
         lines.push(Line::from(Span::styled(format!(" {}", detail.title), Theme::accent_bold())));
         let fh = if self.detail_folded { "f=展开" } else { "f=折叠" };
-        lines.push(Line::from(Span::styled(format!(" 页 {}/{} | k/j 移动  h/l 翻页  {}  r 回复  p 预览  d 下载  Esc 返回", detail.page, detail.last_page, fh), Theme::text_dim())));
+        lines.push(Line::from(Span::styled(format!(" 页 {}/{} | k/j 移动  {}  r 回复  p 预览  d 下载  Esc 返回", detail.page, detail.last_page, fh), Theme::text_dim())));
         lines.push(Line::from(""));
         for (i, post) in detail.posts.iter().enumerate() {
             let ind = if i == self.detail_scroll { "▸" } else { " " };
@@ -680,12 +790,14 @@ impl App {
         let end = (scroll + visible).min(total_lines);
         let vl: Vec<Line> = lines[scroll..end].to_vec();
         f.render_widget(Clear, text_area);
-        let block = Block::default().borders(Borders::ALL).border_style(Theme::block())
-            .title(format!(" 帖子 ({} 回复) ", detail.posts.len())).title_style(Theme::text_dim());
-        f.render_widget(block, text_area);
         f.render_widget(
-            Paragraph::new(vl).wrap(Wrap { trim: false }),
+            Paragraph::new(vl).wrap(Wrap { trim: true }),
             text_area.inner(ratatui::layout::Margin { vertical: 1, horizontal: 1 }),
+        );
+        f.render_widget(
+            Block::default().borders(Borders::ALL).border_style(Theme::block())
+                .title(format!(" 帖子 ({} 回复) ", detail.posts.len())).title_style(Theme::text_dim()),
+            text_area,
         );
     }
 
@@ -696,15 +808,20 @@ impl App {
             SimpleListType::Favorites => "收藏", SimpleListType::Attention => "关注", SimpleListType::Sms => "短消息",
             SimpleListType::SmsDetail => "短消息详情", SimpleListType::Notify => "通知",
         };
+        let inner_w = area.width.saturating_sub(5) as usize;
         let items: Vec<ListItem> = self.simple_list.items.iter().enumerate().map(|(i, item)| {
             let p = if i == self.simple_selected { "▸" } else { " " };
-            let t = format!(" {} {} | {} | {}", p, item.title, item.author, item.time);
+            let mut t = format!(" {} {} | {} | {}", p, item.title, item.author, item.time);
+            if display_width(&t) > inner_w { t = take_display_width(&t, inner_w); }
             if i == self.simple_selected { ListItem::new(Line::from(Span::styled(t, Theme::accent()))) }
             else { ListItem::new(Line::from(Span::styled(t, Theme::text()))) }
         }).collect();
-        f.render_widget(List::new(items).block(
-            Block::default().borders(Borders::ALL).border_style(Theme::block()).title(format!(" {} ", title)).title_style(Theme::text_dim())
-        ), area);
+        f.render_widget(Clear, area);
+        f.render_widget(List::new(items), area.inner(ratatui::layout::Margin { vertical: 1, horizontal: 1 }));
+        f.render_widget(
+            Block::default().borders(Borders::ALL).border_style(Theme::block()).title(format!(" {} ", title)).title_style(Theme::text_dim()),
+            area,
+        );
     }
 
     fn render_compose(&self, f: &mut Frame, area: Rect) {
@@ -716,11 +833,22 @@ impl App {
     }
 
     fn render_search(&self, f: &mut Frame, area: Rect) {
-        let pa = centered_rect(area, 50, 10);
-        let c = Layout::default().direction(Direction::Vertical).constraints([Constraint::Length(1), Constraint::Length(3)]).split(pa);
-        f.render_widget(Paragraph::new(format!(" 🔍 {}▌", self.search_query)).style(Theme::text())
-            .block(Block::default().borders(Borders::ALL).border_style(Theme::accent()).title(" 搜索 ").title_style(Theme::accent())), c[1]);
+        let w = area.width.min(60);
+        let pa = Rect::new(area.x + (area.width - w) / 2, area.y + (area.height - 3) / 2, w, 3);
+        let query_display: String = if display_width(&self.search_query) > w as usize - 6 {
+            take_display_width(&self.search_query, w as usize - 6)
+        } else { self.search_query.clone() };
+        f.render_widget(Clear, pa);
+        f.render_widget(Paragraph::new(format!(" {}▌", query_display)).style(Theme::text())
+            .block(Block::default().borders(Borders::ALL).border_style(Theme::accent()).title(" 搜索 ").title_style(Theme::accent())), pa);
     }
+}
+
+fn display_width(s: &str) -> usize { UnicodeWidthStr::width(s) }
+
+fn take_display_width(s: &str, max_w: usize) -> String {
+    let mut w = 0usize;
+    s.chars().take_while(|c| { w += c.width().unwrap_or(0); w <= max_w }).collect()
 }
 
 fn parse_sixel_size(data: &[u8]) -> (u16, u16) {

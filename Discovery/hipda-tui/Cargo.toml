@@ -5,7 +5,7 @@ edition = "2021"
 description = "TUI forum client for HiPDA (4d4y.com)"
 
 [profile.release]
-opt-level = "s"
+opt-level = "z"
 lto = true
 codegen-units = 1
 strip = true
@@ -24,3 +24,4 @@ clap = { version = "4", features = ["derive"] }
 md-5 = "0.10"
 encoding_rs = "0.8"
 anyhow = "1"
+unicode-width = "0.2"

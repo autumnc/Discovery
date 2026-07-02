@@ -9,4 +9,4 @@ pub struct ThreadItem {
     pub thread_type: String, pub max_page: i32,
 }
 #[derive(Debug, Clone, Default)]
-pub struct ThreadList { pub threads: Vec<ThreadItem>, pub uid: String, pub parsed: bool }
+pub struct ThreadList { pub threads: Vec<ThreadItem>, pub uid: String, pub parsed: bool, pub max_page: i32 }
